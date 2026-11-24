@@ -1,0 +1,88 @@
+name: Babylon.js WebGL2 benchmark
+on:
+  push:
+    paths:
+      - '.github/workflows/babylon-benchmark.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned Babylon.js and browser test dependencies
+        run: |
+          npm install --no-audit --no-fund babylonjs@9.37.2 babylonjs-loaders@9.37.2 playwright
+          npx playwright install --with-deps chromium
+      - name: Test WebGL2 and render a Babylon.js scene
+        run: |
+          mkdir -p evidence
+          cat > benchmark.cjs <<'EOF'
+          const {chromium} = require('playwright');
+          const fs = require('node:fs');
+          (async () => {
+            const browser = await chromium.launch({headless:true,args:['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader']});
+            try {
+              const page = await browser.newPage({viewport:{width:1280,height:720}});
+              const errors=[];
+              page.on('pageerror',e=>errors.push(e.message));
+              await page.setContent('<html><body style="margin:0"><canvas id="scene" width="1280" height="720"></canvas></body></html>');
+              await page.addScriptTag({path:require.resolve('babylonjs/babylon.js')});
+              await page.addScriptTag({path:require.resolve('babylonjs-loaders/babylonjs.loaders.min.js')});
+              const result=await page.evaluate(async()=>{
+                const B=window.BABYLON;
+                const canvas=document.getElementById('scene');
+                const engine=new B.Engine(canvas,true,{preserveDrawingBuffer:true,stencil:true});
+                const scene=new B.Scene(engine);
+                scene.clearColor=new B.Color4(.15,.18,.21,1);
+                const camera=new B.ArcRotateCamera('camera',-Math.PI/2.5,1.0,7,new B.Vector3(0,.9,0),scene);
+                camera.minZ=.05;
+                const hemi=new B.HemisphericLight('sky',new B.Vector3(0,1,0),scene);
+                hemi.intensity=.65;
+                const sun=new B.DirectionalLight('sun',new B.Vector3(-.6,-1,.4),scene);
+                sun.position=new B.Vector3(3,5,-3);
+                sun.intensity=2;
+                const shadow=new B.ShadowGenerator(1024,sun);
+                shadow.usePercentageCloserFiltering=true;
+                const floor=B.MeshBuilder.CreateGround('floor',{width:12,height:12},scene);
+                const clay=new B.PBRMaterial('clay',scene);
+                clay.albedoColor=new B.Color3(.58,.30,.17);
+                clay.roughness=.65;
+                clay.metallic=0;
+                const sphere=B.MeshBuilder.CreateSphere('reference',{diameter:1.7,segments:48},scene);
+                sphere.position.y=.9;
+                sphere.material=clay;
+                shadow.addShadowCaster(sphere);
+                floor.receiveShadows=true;
+                const m=new B.StandardMaterial('floor material',scene);
+                m.diffuseColor=new B.Color3(.43,.45,.41);
+                floor.material=m;
+                await scene.whenReadyAsync();
+                for(let i=0;i<8;i++) scene.render();
+                const gl=engine._gl;
+                const ext=gl.getExtension('WEBGL_debug_renderer_info');
+                const pixels=new Uint8Array(1280*720*4);
+                gl.readPixels(0,0,1280,720,gl.RGBA,gl.UNSIGNED_BYTE,pixels);
+                let varied=0;
+                for(let i=0;i<pixels.length;i+=4){if(Math.abs(pixels[i]-pixels[0])+Math.abs(pixels[i+1]-pixels[1])+Math.abs(pixels[i+2]-pixels[2])>30)varied++;}
+                return {version:B.Engine.Version,webgl:engine.webGLVersion,renderer:ext?gl.getParameter(ext.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER),gltf:B.SceneLoader.IsPluginForExtensionAvailable('.glb'),variedPixels:varied};
+              });
+              await page.screenshot({path:'evidence/babylon-render.png'});
+              const report={...result,errors};
+              fs.writeFileSync('evidence/report.json',JSON.stringify(report,null,2));
+              console.log(JSON.stringify(report,null,2));
+              if(result.webgl!==2 || !result.gltf || result.variedPixels<1000 || errors.length) throw Error('Graphics benchmark did not pass');
+            } finally {await browser.close();}
+          })().catch(e=>{console.error(e);process.exitCode=1;});
+          EOF
+          node benchmark.cjs
+      - name: Save benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: babylon-webgl-evidence
+          path: evidence/
